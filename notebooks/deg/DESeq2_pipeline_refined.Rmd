@@ -1,0 +1,1164 @@
+---
+title: "DESeq2 Pipeline – HTN vs Control (Pooled & Chamber-Stratified)"
+author: "Destiny Pounds & Micaiah McDonald"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 8,
+  fig.height = 6
+)
+# Final analysis was ran on Destiny's count data
+# Set different wd for future studies
+setwd("/Users/destinypounds/Desktop/MSBD501/Data") 
+```
+
+##################################
+# 0) Setup: install/load packages
+##################################
+
+```{r install-packages}
+# Install BiocManager if not already present — required to install
+# Bioconductor packages (DESeq2, apeglm, annotation databases)
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+# Bioconductor packages:
+#   DESeq2       — core differential expression framework
+#   apeglm       — adaptive shrinkage estimator for log2 fold changes
+#   AnnotationDbi— interface for Bioconductor annotation databases
+#   org.Hs.eg.db — human gene annotation (Ensembl → symbol/name)
+#   limma        — used here only for removeBatchEffect() on VST matrix
+bioc_pkgs <- c("DESeq2", "apeglm", "AnnotationDbi", "org.Hs.eg.db", "limma")
+
+# CRAN packages:
+#   ggplot2  — publication-quality plotting
+#   pheatmap — clustered heatmaps with annotation bars
+#   ggrepel  — non-overlapping text labels on ggplot2 figures
+#   dplyr    — data manipulation utilities
+cran_pkgs <- c("ggplot2", "pheatmap", "ggrepel", "dplyr")
+
+for (pkg in bioc_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, ask = FALSE, update = FALSE)
+  }
+}
+for (pkg in cran_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+```
+
+```{r load-packages}
+library(DESeq2)
+library(apeglm)
+library(limma)        
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(pheatmap)
+library(ggrepel)
+library(dplyr)
+```
+
+############################################################
+# Step 1: Create output folder for all saved plots
+############################################################
+
+```{r output-dir}
+# All figures (boxplots, PCAs, heatmaps, MA/volcano plots) are written
+# to a single 'plots/' subfolder inside the working directory.
+# dir.create() with showWarnings = FALSE is safe to re-run — it will
+# not error if the folder already exists.
+PLOT_DIR <- "plots"
+dir.create(PLOT_DIR, showWarnings = FALSE)
+cat("Plots will be saved to:", normalizePath(PLOT_DIR), "\n")
+```
+
+############################################################
+# Step 2: Load the featureCounts count matrix
+############################################################
+
+```{r load-counts}
+#Load featurecounts
+fc <- read.delim(
+  "/Users/destinypounds/Desktop/MSBD501/Data/featurecounts_counts.txt",
+  comment.char     = "#",
+  stringsAsFactors = FALSE,
+  check.names      = FALSE
+)
+
+# Separate annotation from count data
+gene_annot       <- fc[, 1:6]          # columns 1–6: gene metadata
+counts           <- fc[, 7:ncol(fc)]   # columns 7+: raw integer counts
+rownames(counts) <- fc$Geneid
+
+# featureCounts prefixes each column name with the BAM path used.
+# Strip "bam/" prefix and ".bam" suffix to get clean SRR accession IDs.
+colnames(counts) <- gsub("^bam/",   "", colnames(counts))
+colnames(counts) <- gsub("\\.bam$", "", colnames(counts))
+
+# DESeq2 requires the count matrix to be an integer matrix.
+counts <- as.matrix(counts)
+storage.mode(counts) <- "integer"
+
+#Check counts
+head(counts[, 1:4])
+```
+
+############################################################
+# Step 3: Sample metadata
+############################################################
+
+```{r sample-metadata}
+# Columns:
+#   condition — experimental group (Control vs HTN); Control is reference
+#   ventricle — chamber of origin (Left vs Right); used as covariate
+#   donor     — donor ID; paired LV/RV samples share the same donor number
+#   label     — readable label used for visualization purposes
+
+coldata <- data.frame(
+  row.names = colnames(counts),
+  condition = c(
+    "Control", "Control", "HTN",     "HTN",     "Control",
+    "Control", "HTN",     "HTN",     "HTN",     "HTN"
+  ),
+  ventricle = c(
+    "Right",   "Left",    "Right",   "Left",    "Right",
+    "Left",    "Right",   "Left",    "Right",   "Left"
+  ),
+  donor = factor(c(7, 7, 5, 5, 4, 4, 3, 3, 1, 1)),
+  label = c(
+    "Donor 7, RV", "Donor 7, LV",
+    "Donor 5, RV", "Donor 5, LV",
+    "Donor 4, RV", "Donor 4, LV",
+    "Donor 3, RV", "Donor 3, LV",
+    "Donor 1, RV", "Donor 1, LV"
+  )
+)
+
+# Set factor levels so DESeq2 uses the correct reference:
+#   condition: "Control" is ref 
+#   ventricle: "Left"    is ref 
+coldata$condition <- factor(coldata$condition, levels = c("Control", "HTN"))
+coldata$ventricle <- factor(coldata$ventricle, levels = c("Left", "Right"))
+
+#View column data
+coldata
+```
+
+############################################################
+# Step 4: Filter low-count genes (shared across all analyses)
+############################################################
+
+```{r filter-counts}
+# Genes with very low counts carry little statistical information and
+# inflate multiple-testing burden. We retain only genes with >= 10
+# counts in at least 2 samples (the size of the smallest group).
+keep   <- rowSums(counts >= 10) >= 2
+counts <- counts[keep, ]
+cat("Genes retained after filtering:", nrow(counts), "\n")
+```
+
+############################################################
+# Helper functions
+# Defined once — called identically across all 3 analyses.
+############################################################
+
+```{r helpers}
+# ---------------------------------------------------------------------------
+# annotate_results()
+# Maps Ensembl gene IDs (with version suffix, e.g. ENSG00000141510.18)
+# to human-readable gene symbols (e.g. TP53) and full gene names.
+# Version suffixes are stripped with sub() before mapping.
+# ---------------------------------------------------------------------------
+annotate_results <- function(res_df) {
+  res_df$gene_id    <- rownames(res_df)
+  res_df$ensembl_id <- sub("\\..*$", "", res_df$gene_id)   # strip version
+
+  res_df$gene_symbol <- mapIds(
+    org.Hs.eg.db,
+    keys      = res_df$ensembl_id,
+    column    = "SYMBOL",
+    keytype   = "ENSEMBL",
+    multiVals = "first"
+  )
+  res_df$gene_name <- mapIds(
+    org.Hs.eg.db,
+    keys      = res_df$ensembl_id,
+    column    = "GENENAME",
+    keytype   = "ENSEMBL",
+    multiVals = "first"
+  )
+  res_df
+}
+
+# ---------------------------------------------------------------------------
+# mark_significance()
+# Classifies each gene as Upregulated, Downregulated, or Not Significant
+# using standard thresholds: padj < 0.05 AND |log2FoldChange| > 1.
+#
+# Also builds a balanced top-label set for plots: the n_each most
+# significant upregulated genes + n_each most significant downregulated
+# genes (ranked by padj). Balanced selection ensures both directions are
+# represented in volcano and MA plot labels rather than one side dominating.
+#
+# Returns a named list:
+#   $res_df     — full results with significance column 
+#   $sig_only   — subset of significant genes only
+#   $top_labels — balanced label subset for plot annotation
+# ---------------------------------------------------------------------------
+mark_significance <- function(res_df, padj_cut = 0.05, lfc_cut = 1, n_each = 5) {
+  res_df$significance <- "Not Significant"
+  res_df$significance[
+    !is.na(res_df$padj) & res_df$padj < padj_cut & res_df$log2FoldChange >  lfc_cut
+  ] <- "Upregulated"
+  res_df$significance[
+    !is.na(res_df$padj) & res_df$padj < padj_cut & res_df$log2FoldChange < -lfc_cut
+  ] <- "Downregulated"
+
+  # log10(baseMean + 1) used as x-axis in MA plots
+  res_df$baseMean_log10 <- log10(res_df$baseMean + 1)
+
+  sig_only <- subset(res_df, !is.na(padj) & padj < padj_cut & abs(log2FoldChange) > lfc_cut)
+
+  # Split by direction, sort by padj, take top n_each from each side
+  up_sig   <- sig_only[sig_only$log2FoldChange >  lfc_cut, ]
+  down_sig <- sig_only[sig_only$log2FoldChange < -lfc_cut, ]
+
+  top_labels <- rbind(
+    head(up_sig[order(up_sig$padj), ],     n_each),
+    head(down_sig[order(down_sig$padj), ], n_each)
+  )
+
+  # Fall back to Ensembl ID if gene symbol is missing
+  top_labels$label_name <- ifelse(
+    is.na(top_labels$gene_symbol) | top_labels$gene_symbol == "",
+    rownames(top_labels),
+    top_labels$gene_symbol
+  )
+
+  # Drop any labels with non-finite coordinates (would crash ggrepel)
+  top_labels <- subset(top_labels, is.finite(baseMean_log10) & is.finite(log2FoldChange))
+
+  list(res_df = res_df, sig_only = sig_only, top_labels = top_labels)
+}
+
+# ---------------------------------------------------------------------------
+# make_ma_plot()
+# Creates MA plot: log10(mean expression) on x-axis vs shrunken LFC on y-axis.
+# ---------------------------------------------------------------------------
+make_ma_plot <- function(res_df, top_labels, title) {
+  p <- ggplot(res_df, aes(x = baseMean_log10, y = log2FoldChange, color = significance)) +
+    geom_point(alpha = 0.6) +
+    geom_hline(yintercept = c(-1, 1), linetype = "dashed") +
+    scale_color_manual(values = c(
+      "Upregulated"     = "firebrick",
+      "Downregulated"   = "steelblue",
+      "Not Significant" = "grey60"
+    )) +
+    xlab("log10(Base Mean + 1)") +
+    ylab("Shrunken log2 Fold Change") +
+    ggtitle(title) +
+    theme_minimal()
+
+  if (nrow(top_labels) > 0) {
+    p <- p + ggrepel::geom_text_repel(
+      data        = top_labels,
+      inherit.aes = FALSE,
+      aes(x = baseMean_log10, y = log2FoldChange, label = label_name),
+      size = 3.5, max.overlaps = 20
+    )
+  }
+  p
+}
+
+# ---------------------------------------------------------------------------
+# make_volcano_plot()
+# Creates Volcano plot: LFC on x-axis vs -log10(padj) on y-axis.
+# ---------------------------------------------------------------------------
+make_volcano_plot <- function(res_df, top_labels, title, lfc_cut = 1) {
+  p <- ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj), color = significance)) +
+    geom_point(alpha = 0.6) +
+    geom_vline(xintercept = c(-lfc_cut, lfc_cut), linetype = "dashed") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    scale_color_manual(values = c(
+      "Upregulated"     = "firebrick",
+      "Downregulated"   = "steelblue",
+      "Not Significant" = "grey60"
+    )) +
+    xlab("log2 Fold Change") +
+    ylab("-log10 Adjusted P-value") +
+    ggtitle(title) +
+    theme_minimal()
+
+  if (nrow(top_labels) > 0) {
+    p <- p + ggrepel::geom_text_repel(
+      data        = top_labels,
+      aes(label = label_name),
+      size = 3.5, max.overlaps = 20, show.legend = FALSE
+    )
+  }
+  p
+}
+
+# ---------------------------------------------------------------------------
+# make_heatmap()
+# Creates heatmap of the top n_genes significant DE genes (row-scaled z-scores).
+# Columns are ordered manually (Control before HTN, LV before RV within
+# each condition) rather than clustered, so biological grouping is visible.
+# Donor labels replace SRR accession numbers on column headers.
+# annonation_vars controls what labels are included in the legend.
+# ---------------------------------------------------------------------------
+make_heatmap <- function(vsd_obj, sig_only, coldata_sub,
+                         annotation_vars = c("condition", "ventricle"),
+                         label_col       = "label",
+                         order_by        = c("condition", "ventricle"),
+                         title           = "Top DE Genes",
+                         n_genes         = 30) {
+  if (nrow(sig_only) == 0) {
+    message("No significant genes — heatmap skipped.")
+    return(invisible(NULL))
+  }
+
+  # Select top n genes (already ordered by padj in sig_only)
+  top_genes  <- rownames(sig_only)[1:min(n_genes, nrow(sig_only))]
+  mat        <- assay(vsd_obj)[top_genes, ]
+
+  # Row-wise z-score scaling so expression patterns are comparable
+  # across genes with different absolute expression levels
+  mat_scaled <- t(scale(t(mat)))
+
+  # Use gene symbol as row label; fall back to Ensembl ID if symbol is NA
+  row_lbl <- sig_only[match(top_genes, rownames(sig_only)), "gene_symbol"]
+  row_lbl[is.na(row_lbl)] <- top_genes[is.na(row_lbl)]
+  rownames(mat_scaled) <- row_lbl
+
+  # Reorder columns: e.g. by condition then ventricle
+  col_order      <- do.call(order, lapply(order_by, function(v) coldata_sub[[v]]))
+  mat_scaled     <- mat_scaled[, col_order]
+  ann_clean      <- coldata_sub[col_order, annotation_vars, drop = FALSE]
+
+  # Replace SRR column names with donor labels
+  colnames(mat_scaled) <- coldata_sub[[label_col]][col_order]
+  rownames(ann_clean)  <- coldata_sub[[label_col]][col_order]
+
+  pheatmap(
+    mat_scaled,
+    annotation_col = ann_clean,
+    show_rownames  = TRUE,
+    cluster_cols   = FALSE,   # respect manual column ordering
+    cluster_rows   = TRUE,    # hierarchically cluster genes
+    fontsize        = 12,
+    fontsize_row    = 11,
+    fontsize_col    = 11,
+    main            = title
+  )
+}
+```
+
+############################################################
+# ══════════════════════════════════════════════════════════
+#   ANALYSIS 1 – POOLED  (~ ventricle + condition)
+#
+#   All 10 samples are used together. Ventricle (LV vs RV)
+#   is included as covariate so its expression
+#   effect is removed.
+# ══════════════════════════════════════════════════════════
+############################################################
+
+## 1.1  Build DESeq2 object – pooled
+
+```{r deseq-pooled}
+# Design: ~ ventricle + condition
+#   ventricle — covariate; adjusts for LV/RV expression differences
+#   condition — term of interest; HTN_vs_Control coefficient is extracted
+# DESeq() runs: estimation of size factors → dispersion → negative
+# binomial GLM → Wald test for each gene
+dds_pooled <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData   = coldata,
+  design    = ~ ventricle + condition
+)
+dds_pooled <- DESeq(dds_pooled)
+resultsNames(dds_pooled)   # confirm coefficient names before extracting results
+
+normalized_counts_pooled <- counts(dds_pooled, normalized = TRUE)
+```
+
+## 1.2  Raw vs normalized count boxplots – pooled
+
+```{r boxplots-pooled}
+# Boxplots on log2 scale give a quick visual check that:
+#   Raw:        library sizes differ across samples (unequal medians expected)
+#   Normalized: size-factor correction brings medians into alignment
+# Persistent spread differences after normalization may indicate batch effects
+# or outlier samples worth investigating before proceeding.
+
+# --- Raw counts ---
+png(file.path(PLOT_DIR, "boxplot_raw_counts.png"),
+    width = 1400, height = 800, res = 150)
+par(mar = c(8, 4, 4, 2))
+boxplot(
+  log2(counts + 1),
+  names    = coldata$label,
+  main     = "Raw Gene Expression Counts (All Samples)",
+  ylab     = "log2(count + 1)",
+  las      = 2,
+  cex.axis = 0.8,
+  col      = "grey80"
+)
+dev.off()
+
+# Repeat plotting for inline viewing
+par(mar = c(8, 4, 4, 2))
+boxplot(
+  log2(counts + 1),
+  names    = coldata$label,
+  main     = "Raw Gene Expression Counts (All Samples)",
+  ylab     = "log2(count + 1)",
+  las      = 2,
+  cex.axis = 0.8,
+  col      = "grey80"
+)
+
+# --- Normalized counts ---
+png(file.path(PLOT_DIR, "boxplot_normalized_counts.png"),
+    width = 1400, height = 800, res = 150)
+par(mar = c(8, 4, 4, 2))
+boxplot(
+  log2(normalized_counts_pooled + 1),
+  names    = coldata$label,
+  main     = "Normalized Gene Expression – Pooled Model",
+  ylab     = "log2(normalized count + 1)",
+  las      = 2,
+  cex.axis = 0.8,
+  col      = "grey80"
+)
+dev.off()
+
+#Repeat plotting for inline viewing
+par(mar = c(8, 4, 4, 2))
+boxplot(
+  log2(normalized_counts_pooled + 1),
+  names    = coldata$label,
+  main     = "Normalized Gene Expression – Pooled Model",
+  ylab     = "log2(normalized count + 1)",
+  las      = 2,
+  cex.axis = 0.8,
+  col      = "grey80"
+)
+
+```
+
+## 1.3  VST & PCA – pooled (ventricle batch-corrected for visualization only)
+
+```{r pca-pooled}
+# VST (variance stabilizing transformation) converts raw counts to a
+# roughly homoskedastic log-scale matrix suitable for distance-based
+# visualization. blind = FALSE uses the design to inform the dispersion
+# fit — recommended when the design is well-specified.
+vsd_pooled <- vst(dds_pooled, blind = FALSE)
+
+# removeBatchEffect() from limma regresses out the ventricle effect
+# from the VST matrix FOR VISUALIZATION ONLY. This makes condition
+# separation visible in the PCA without ventricle dominating PC1.
+# IMPORTANT: this modified assay is NOT fed back into DESeq2 — the
+# actual DE model already accounts for ventricle via the design formula.
+assay(vsd_pooled) <- removeBatchEffect(
+  assay(vsd_pooled),
+  batch = colData(vsd_pooled)$ventricle
+)
+
+pca_data   <- plotPCA(vsd_pooled, intgroup = c("condition", "ventricle"), returnData = TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"))
+
+# Replace SRR row names with donor labels for readable plot text
+pca_data$label <- coldata[rownames(pca_data), "label"]
+
+pca_pooled <- ggplot(pca_data,
+    aes(PC1, PC2, color = condition, shape = ventricle, label = label)) +
+  geom_point(size = 4) +
+  geom_text_repel(size = 3.7, max.overlaps = 20) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  ggtitle("PCA – Pooled Analysis (HTN vs Control, adjusted for chamber)") +
+  theme_minimal()
+
+print(pca_pooled)
+ggsave(file.path(PLOT_DIR, "pca_pooled.png"),
+       plot = pca_pooled, width = 8, height = 6, dpi = 150)
+```
+
+## 1.3b  PCA on DEGs only – pooled
+
+```{r pca-pooled-degs}
+# A second PCA restricted to statistically significant DEGs (padj < 0.05,
+# no LFC threshold here) reduces noise from the ~20,000 non-DE genes and
+# can reveal cleaner separation. 
+vsd_fresh <- vst(dds_pooled, blind = FALSE)
+
+res_tmp   <- as.data.frame(results(dds_pooled, contrast = c("condition", "HTN", "Control")))
+sig_genes <- rownames(res_tmp[!is.na(res_tmp$padj) & res_tmp$padj < 0.05, ])
+cat("DEGs used for PCA:", length(sig_genes), "\n")
+
+# Correct only the DEG rows for ventricle before running PCA
+mat_sig_corrected <- removeBatchEffect(
+  assay(vsd_fresh)[sig_genes, ],
+  batch = colData(vsd_fresh)$ventricle
+)
+
+# prcomp() with scale. = TRUE standardizes variance across genes,
+# preventing high-variance genes from dominating the components
+pca_res    <- prcomp(t(mat_sig_corrected), scale. = TRUE)
+percentVar <- round(100 * pca_res$sdev^2 / sum(pca_res$sdev^2))
+
+pca_deg_df <- data.frame(
+  PC1       = pca_res$x[, 1],
+  PC2       = pca_res$x[, 2],
+  condition = colData(vsd_fresh)$condition,
+  ventricle = colData(vsd_fresh)$ventricle,
+  label     = coldata$label
+)
+
+pca_degs <- ggplot(pca_deg_df,
+    aes(PC1, PC2, color = condition, shape = ventricle, label = label)) +
+  geom_point(size = 4) +
+  geom_text_repel(size = 3.7, max.overlaps = 20) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  ggtitle("PCA – DEGs Only (HTN vs Control, adjusted for ventricle)") +
+  theme_minimal()
+
+print(pca_degs)
+ggsave(file.path(PLOT_DIR, "pca_pooled_degs.png"),
+       plot = pca_degs, width = 8, height = 6, dpi = 150)
+```
+
+## 1.4  Sample-to-sample distance heatmap – pooled
+
+```{r dist-heatmap-pooled}
+# Euclidean distances between samples in VST space reveal global
+# clustering structure. Samples from the same condition or chamber
+# that cluster together confirm expected biological groupings.
+sampleDistMatrix  <- as.matrix(dist(t(assay(vsd_pooled))))
+
+dist_col_order_pooled <- order(coldata$condition, coldata$ventricle)
+dist_labels_pooled    <- coldata$label[dist_col_order_pooled]
+
+sampleDistMatrix_ord           <- sampleDistMatrix[dist_col_order_pooled, dist_col_order_pooled]
+colnames(sampleDistMatrix_ord) <- dist_labels_pooled
+rownames(sampleDistMatrix_ord) <- dist_labels_pooled
+
+annotation_pooled_ord           <- coldata[dist_col_order_pooled, c("condition", "ventricle"), drop = FALSE]
+rownames(annotation_pooled_ord) <- dist_labels_pooled
+
+dist_heatmap_pooled <- pheatmap(
+  sampleDistMatrix_ord,
+  annotation_col = annotation_pooled_ord,
+  labels_col     = dist_labels_pooled,
+  labels_row     = dist_labels_pooled,
+  cluster_rows   = FALSE,
+  cluster_cols   = FALSE,
+  fontsize        = 12,
+  main            = "Sample-to-sample Distance – Pooled"
+)
+print(dist_heatmap_pooled)
+ggsave(file.path(PLOT_DIR, "distance_heatmap_pooled.png"),
+       plot = dist_heatmap_pooled, width = 8, height = 6, dpi = 150)
+```
+
+## 1.5  DE results & LFC shrinkage – pooled
+
+```{r results-pooled}
+# Extract the HTN vs Control contrast from the pooled model.
+res_pooled <- results(dds_pooled, contrast = c("condition", "HTN", "Control"))
+res_pooled <- res_pooled[order(res_pooled$padj), ]
+summary(res_pooled)
+
+# lfcShrink() with type = "apeglm" applies adaptive shrinkage to
+# log2FoldChange estimates. This pulls noisy LFC estimates from low-count
+# genes toward zero, producing more reliable fold-change rankings.
+res_pooled_shrunk <- lfcShrink(dds_pooled,
+  coef = "condition_HTN_vs_Control", type = "apeglm")
+res_pooled_shrunk <- res_pooled_shrunk[order(res_pooled_shrunk$padj), ]
+res_df_pooled     <- as.data.frame(res_pooled_shrunk)
+```
+
+## 1.6  Annotate – pooled
+
+```{r annotate-pooled}
+# Map Ensembl IDs to gene symbols and full names via org.Hs.eg.db.
+res_df_pooled <- annotate_results(res_df_pooled)
+```
+
+## 1.7  Significance & top labels – pooled
+
+```{r sig-pooled}
+# Thresholds: padj < 0.05 (FDR) AND |LFC| > 1
+# (at least 2-fold change after shrinkage). Both criteria must be met.
+# Top labels: 5 most significant upregulated + 5 most significant
+# downregulated genes (by padj) for balanced MA and volcano annotations.
+pooled_out        <- mark_significance(res_df_pooled)
+res_df_pooled     <- pooled_out$res_df
+sig_only_pooled   <- pooled_out$sig_only
+top_labels_pooled <- pooled_out$top_labels
+
+table(res_df_pooled$significance)
+cat("Significant DEGs (pooled):", nrow(sig_only_pooled), "\n")
+head(sig_only_pooled[, c("gene_symbol", "gene_name", "log2FoldChange", "padj")])
+```
+
+## 1.8  MA plot – pooled
+
+```{r ma-pooled}
+p_ma_pooled <- make_ma_plot(res_df_pooled, top_labels_pooled,
+  "MA Plot – Pooled (HTN vs Control, adjusted for chamber)")
+print(p_ma_pooled)
+ggsave(file.path(PLOT_DIR, "ma_plot_pooled.png"),
+       plot = p_ma_pooled, width = 8, height = 6, dpi = 150)
+```
+
+## 1.9  Volcano plot – pooled
+
+```{r volcano-pooled}
+# Volcano plot displays statistical significance (-log10 padj) against
+# effect size (log2FC) for every gene. Genes in the upper corners
+# (true DEGs) are highlighted and labeled.
+volcano_pooled <- make_volcano_plot(
+  res_df_pooled, top_labels_pooled,
+  "Volcano Plot – Pooled (HTN vs Control, adjusted for chamber)"
+)
+print(volcano_pooled)
+ggsave(file.path(PLOT_DIR, "volcano_pooled.png"),
+       plot = volcano_pooled, width = 8, height = 6, dpi = 150)
+```
+
+## 1.10  Heatmap – pooled
+
+```{r heatmap-pooled}
+# Heatmap of top 30 significant DE genes.
+top_heatmap_pooled <- make_heatmap(
+  vsd_obj     = vsd_pooled,
+  sig_only    = sig_only_pooled,
+  coldata_sub = coldata,
+  title       = "Top DE Genes – Pooled Analysis"
+)
+if (!is.null(top_heatmap_pooled)) {
+  print(top_heatmap_pooled)
+  ggsave(file.path(PLOT_DIR, "heatmap_pooled.png"),
+         plot = top_heatmap_pooled, width = 10, height = 8, dpi = 150)
+}
+```
+
+## 1.11  Top 20 significant genes – pooled
+
+```{r top20-pooled}
+# Preview of the 20 most significant DEGs for a quick check
+top20_pooled <- head(sig_only_pooled[order(sig_only_pooled$padj), ], 20)
+top20_pooled[, c("gene_symbol", "gene_name", "log2FoldChange", "padj")]
+```
+
+## 1.12  Save pooled output
+
+```{r save-pooled}
+# Four CSV files per analysis:
+#   *_full.csv        — all genes with shrunken LFC, padj, and annotation
+#   *_significant.csv — significant genes only (padj < 0.05 & |LFC| > 1)
+#   *_top20.csv       — top 20 by padj for quick reference
+#   normalized_counts — size-factor-corrected count matrix
+write.csv(res_df_pooled,            "DESeq2_Pooled_HTN_vs_Control.csv",            row.names = FALSE)
+write.csv(sig_only_pooled,          "DESeq2_Pooled_HTN_vs_Control_significant.csv", row.names = FALSE)
+write.csv(top20_pooled,             "DESeq2_Pooled_top20.csv",                      row.names = FALSE)
+write.csv(normalized_counts_pooled, "normalized_counts_pooled.csv")
+```
+
+############################################################
+# ══════════════════════════════════════════════════════════
+#   ANALYSIS 2 – LV ONLY  (~ condition)
+#
+#   Subset to Left Ventricle samples only. With a single
+#   chamber there is no ventricle covariate, so the design
+#   simplifies to ~ condition. Fewer samples means reduced
+#   power, but chamber-specific results can reveal LV-
+#   selective HTN gene expression changes.
+# ══════════════════════════════════════════════════════════
+############################################################
+
+## 2.1  Subset to LV
+
+```{r subset-lv}
+# Subset count matrix and metadata to LV samples only.
+# droplevels() removes the unused "Right" level from the ventricle factor
+# so DESeq2 does not try to estimate a coefficient for a missing group.
+# A fresh per-subset low-count filter is applied because genes that pass
+# the global filter may still be very lowly expressed in LV samples alone.
+lv_samples           <- rownames(coldata)[coldata$ventricle == "Left"]
+counts_lv            <- counts[, lv_samples]
+coldata_lv           <- coldata[lv_samples, , drop = FALSE]
+coldata_lv$ventricle <- droplevels(coldata_lv$ventricle)
+
+keep_lv   <- rowSums(counts_lv >= 10) >= 2
+counts_lv <- counts_lv[keep_lv, ]
+cat("LV samples:", ncol(counts_lv), "| Genes retained:", nrow(counts_lv), "\n")
+coldata_lv
+```
+
+## 2.2  DESeq2 – LV only
+
+```{r deseq-lv}
+dds_lv <- DESeqDataSetFromMatrix(
+  countData = counts_lv, colData = coldata_lv, design = ~ condition)
+dds_lv <- DESeq(dds_lv)
+resultsNames(dds_lv)
+normalized_counts_lv <- counts(dds_lv, normalized = TRUE)
+```
+
+## 2.3  Raw vs normalized count boxplots – LV only
+
+```{r boxplots-lv}
+# LV-only boxplots confirm normalization within this subset.
+#Raw plot
+png(file.path(PLOT_DIR, "boxplot_raw_counts_lv.png"),
+    width = 1000, height = 700, res = 150)
+par(mar = c(8, 4, 4, 2))
+boxplot(
+  log2(counts_lv + 1),
+  names    = coldata_lv$label,
+  main     = "Raw Gene Expression Counts – LV Only",
+  ylab     = "log2(count + 1)",
+  las      = 2, cex.axis = 0.8,
+  col      = "grey80"
+)
+dev.off()
+
+#Plot again
+par(mar = c(8, 4, 4, 2))
+boxplot(
+  log2(counts_lv + 1),
+  names    = coldata_lv$label,
+  main     = "Raw Gene Expression Counts – LV Only",
+  ylab     = "log2(count + 1)",
+  las      = 2, cex.axis = 0.8,
+  col      = "grey80"
+)
+
+#Normalized plot
+png(file.path(PLOT_DIR, "boxplot_normalized_counts_lv.png"),
+    width = 1000, height = 700, res = 150)
+par(mar = c(8, 4, 4, 2))
+boxplot(
+  log2(normalized_counts_lv + 1),
+  names    = coldata_lv$label,
+  main     = "Normalized Gene Expression – LV Only",
+  ylab     = "log2(normalized count + 1)",
+  las      = 2, cex.axis = 0.8,
+  col      = "grey80"
+)
+
+dev.off()
+#Plot again
+par(mar = c(8, 4, 4, 2))
+boxplot(
+  log2(normalized_counts_lv + 1),
+  names    = coldata_lv$label,
+  main     = "Normalized Gene Expression – LV Only",
+  ylab     = "log2(normalized count + 1)",
+  las      = 2, cex.axis = 0.8,
+  col      = "grey80"
+)
+
+```
+
+## 2.4  VST & PCA – LV only
+
+```{r pca-lv}
+# PCA Plot
+vsd_lv        <- vst(dds_lv, blind = FALSE)
+pca_data_lv   <- plotPCA(vsd_lv, intgroup = "condition", returnData = TRUE)
+percentVar_lv <- round(100 * attr(pca_data_lv, "percentVar"))
+pca_data_lv$label <- coldata_lv[rownames(pca_data_lv), "label"]
+
+pca_lv <- ggplot(pca_data_lv, aes(PC1, PC2, color = condition, label = label)) +
+  geom_point(size = 4) +
+  geom_text_repel(size = 3.7, max.overlaps = 20) +
+  xlab(paste0("PC1: ", percentVar_lv[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar_lv[2], "% variance")) +
+  ggtitle("PCA – Left Ventricle Only (HTN vs Control)") +
+  theme_minimal()
+
+print(pca_lv)
+ggsave(file.path(PLOT_DIR, "pca_lv.png"),
+       plot = pca_lv, width = 8, height = 6, dpi = 150)
+```
+
+## 2.5  Sample distance heatmap – LV only
+
+```{r dist-heatmap-lv}
+# Order columns/rows: Control before HTN
+dist_col_order_lv             <- order(coldata_lv$condition)
+dist_labels_lv                <- coldata_lv$label[dist_col_order_lv]
+
+sampleDistMatrix_lv           <- as.matrix(dist(t(assay(vsd_lv))))
+sampleDistMatrix_lv_ord       <- sampleDistMatrix_lv[dist_col_order_lv, dist_col_order_lv]
+colnames(sampleDistMatrix_lv_ord) <- dist_labels_lv
+rownames(sampleDistMatrix_lv_ord) <- dist_labels_lv
+
+annotation_lv_ord             <- coldata_lv[dist_col_order_lv, "condition", drop = FALSE]
+rownames(annotation_lv_ord)   <- dist_labels_lv
+
+dist_heatmap_lv <- pheatmap(
+  sampleDistMatrix_lv_ord,
+  annotation_col = annotation_lv_ord,
+  labels_col     = dist_labels_lv,
+  labels_row     = dist_labels_lv,
+  cluster_rows   = FALSE,
+  cluster_cols   = FALSE,
+  fontsize = 12,
+  main = "Sample-to-sample Distance – LV Only"
+)
+print(dist_heatmap_lv)
+ggsave(file.path(PLOT_DIR, "distance_heatmap_lv.png"),
+       plot = dist_heatmap_lv, width = 8, height = 6, dpi = 150)
+```
+
+## 2.6  DE results & LFC shrinkage – LV only
+
+```{r results-lv}
+res_lv <- results(dds_lv, contrast = c("condition", "HTN", "Control"))
+summary(res_lv[order(res_lv$padj), ])
+
+res_lv_shrunk <- lfcShrink(dds_lv,
+  coef = "condition_HTN_vs_Control", type = "apeglm")
+res_df_lv <- as.data.frame(res_lv_shrunk[order(res_lv_shrunk$padj), ])
+```
+
+## 2.7  Annotate – LV only
+
+```{r annotate-lv}
+res_df_lv <- annotate_results(res_df_lv)
+```
+
+## 2.8  Significance & top labels – LV only
+
+```{r sig-lv}
+lv_out        <- mark_significance(res_df_lv)
+res_df_lv     <- lv_out$res_df
+sig_only_lv   <- lv_out$sig_only
+top_labels_lv <- lv_out$top_labels
+
+table(res_df_lv$significance)
+cat("Significant DEGs (LV):", nrow(sig_only_lv), "\n")
+```
+
+## 2.9  MA plot – LV only
+
+```{r ma-lv}
+p_ma_lv <- make_ma_plot(res_df_lv, top_labels_lv,
+  "MA Plot – Left Ventricle Only (HTN vs Control)")
+print(p_ma_lv)
+ggsave(file.path(PLOT_DIR, "ma_plot_lv.png"),
+       plot = p_ma_lv, width = 8, height = 6, dpi = 150)
+```
+
+## 2.10  Volcano plot – LV only
+
+```{r volcano-lv}
+volcano_lv <- make_volcano_plot(res_df_lv, top_labels_lv,
+  "Volcano Plot – Left Ventricle Only (HTN vs Control)")
+print(volcano_lv)
+ggsave(file.path(PLOT_DIR, "volcano_lv.png"),
+       plot = volcano_lv, width = 8, height = 6, dpi = 150)
+```
+
+## 2.11  Heatmap – LV only
+
+```{r heatmap-lv}
+top_heatmap_lv <- make_heatmap(
+  vsd_obj         = vsd_lv,
+  sig_only        = sig_only_lv,
+  coldata_sub     = coldata_lv,
+  annotation_vars = "condition",
+  order_by        = "condition",
+  title           = "Top DE Genes – Left Ventricle Only"
+)
+if (!is.null(top_heatmap_lv)) {
+  print(top_heatmap_lv)
+  ggsave(file.path(PLOT_DIR, "heatmap_lv.png"),
+         plot = top_heatmap_lv, width = 10, height = 8, dpi = 150)
+}
+```
+
+## 2.12  Top 20 – LV only
+
+```{r top20-lv}
+top20_lv <- head(sig_only_lv[order(sig_only_lv$padj), ], 20)
+top20_lv[, c("gene_symbol", "gene_name", "log2FoldChange", "padj")]
+```
+
+## 2.13  Save LV output
+
+```{r save-lv}
+write.csv(res_df_lv,           "DESeq2_LV_HTN_vs_Control.csv",            row.names = FALSE)
+write.csv(sig_only_lv,         "DESeq2_LV_HTN_vs_Control_significant.csv", row.names = FALSE)
+write.csv(top20_lv,            "DESeq2_LV_top20.csv",                      row.names = FALSE)
+write.csv(normalized_counts_lv,"normalized_counts_lv.csv")
+```
+
+############################################################
+# ══════════════════════════════════════════════════════════
+#   ANALYSIS 3 – RV ONLY  (~ condition)
+#
+#   Mirror of Analysis 2 for the Right Ventricle. Comparing
+#   LV-only and RV-only results against the pooled analysis
+#   reveals chamber-specific vs shared HTN gene responses.
+# ══════════════════════════════════════════════════════════
+############################################################
+
+## 3.1  Subset to RV
+
+```{r subset-rv}
+rv_samples           <- rownames(coldata)[coldata$ventricle == "Right"]
+counts_rv            <- counts[, rv_samples]
+coldata_rv           <- coldata[rv_samples, , drop = FALSE]
+coldata_rv$ventricle <- droplevels(coldata_rv$ventricle)
+
+keep_rv   <- rowSums(counts_rv >= 10) >= 2
+counts_rv <- counts_rv[keep_rv, ]
+cat("RV samples:", ncol(counts_rv), "| Genes retained:", nrow(counts_rv), "\n")
+coldata_rv
+```
+
+## 3.2  DESeq2 – RV only
+
+```{r deseq-rv}
+dds_rv <- DESeqDataSetFromMatrix(
+  countData = counts_rv, colData = coldata_rv, design = ~ condition)
+dds_rv <- DESeq(dds_rv)
+resultsNames(dds_rv)
+normalized_counts_rv <- counts(dds_rv, normalized = TRUE)
+```
+
+## 3.3  Raw vs normalized count boxplots – RV only
+
+```{r boxplots-rv}
+#Raw plots
+png(file.path(PLOT_DIR, "boxplot_raw_counts_rv.png"),
+    width = 1000, height = 700, res = 150)
+par(mar = c(8, 4, 4, 2))
+boxplot(
+  log2(counts_rv + 1),
+  names    = coldata_rv$label,
+  main     = "Raw Gene Expression Counts – RV Only",
+  ylab     = "log2(count + 1)",
+  las      = 2, cex.axis = 0.8,
+  col      = "grey80"
+)
+dev.off()
+
+par(mar = c(8, 4, 4, 2))
+boxplot(
+  log2(counts_rv + 1),
+  names    = coldata_rv$label,
+  main     = "Raw Gene Expression Counts – RV Only",
+  ylab     = "log2(count + 1)",
+  las      = 2, cex.axis = 0.8,
+  col      = "grey80"
+)
+
+#Normalized plots
+png(file.path(PLOT_DIR, "boxplot_normalized_counts_rv.png"),
+    width = 1000, height = 700, res = 150)
+par(mar = c(8, 4, 4, 2))
+boxplot(
+  log2(normalized_counts_rv + 1),
+  names    = coldata_rv$label,
+  main     = "Normalized Gene Expression – RV Only",
+  ylab     = "log2(normalized count + 1)",
+  las      = 2, cex.axis = 0.8,
+  col      = "grey80"
+)
+
+dev.off()
+
+par(mar = c(8, 4, 4, 2))
+boxplot(
+  log2(normalized_counts_rv + 1),
+  names    = coldata_rv$label,
+  main     = "Normalized Gene Expression – RV Only",
+  ylab     = "log2(normalized count + 1)",
+  las      = 2, cex.axis = 0.8,
+  col      = "grey80"
+)
+```
+
+## 3.4  VST & PCA – RV only
+
+```{r pca-rv}
+vsd_rv        <- vst(dds_rv, blind = FALSE)
+pca_data_rv   <- plotPCA(vsd_rv, intgroup = "condition", returnData = TRUE)
+percentVar_rv <- round(100 * attr(pca_data_rv, "percentVar"))
+pca_data_rv$label <- coldata_rv[rownames(pca_data_rv), "label"]
+
+pca_rv <- ggplot(pca_data_rv, aes(PC1, PC2, color = condition, label = label)) +
+  geom_point(size = 4) +
+  geom_text_repel(size = 3.7, max.overlaps = 20) +
+  xlab(paste0("PC1: ", percentVar_rv[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar_rv[2], "% variance")) +
+  ggtitle("PCA – Right Ventricle Only (HTN vs Control)") +
+  theme_minimal()
+
+print(pca_rv)
+ggsave(file.path(PLOT_DIR, "pca_rv.png"),
+       plot = pca_rv, width = 8, height = 6, dpi = 150)
+```
+
+## 3.5  Sample distance heatmap – RV only
+
+```{r dist-heatmap-rv}
+# Order columns/rows: Control before HTN
+dist_col_order_rv             <- order(coldata_rv$condition)
+dist_labels_rv                <- coldata_rv$label[dist_col_order_rv]
+
+sampleDistMatrix_rv           <- as.matrix(dist(t(assay(vsd_rv))))
+sampleDistMatrix_rv_ord       <- sampleDistMatrix_rv[dist_col_order_rv, dist_col_order_rv]
+colnames(sampleDistMatrix_rv_ord) <- dist_labels_rv
+rownames(sampleDistMatrix_rv_ord) <- dist_labels_rv
+
+annotation_rv_ord             <- coldata_rv[dist_col_order_rv, "condition", drop = FALSE]
+rownames(annotation_rv_ord)   <- dist_labels_rv
+
+dist_heatmap_rv <- pheatmap(
+  sampleDistMatrix_rv_ord,
+  annotation_col = annotation_rv_ord,
+  labels_col     = dist_labels_rv,
+  labels_row     = dist_labels_rv,
+  cluster_rows   = FALSE,
+  cluster_cols   = FALSE,
+  fontsize = 12,
+  main = "Sample-to-sample Distance – RV Only"
+)
+print(dist_heatmap_rv)
+ggsave(file.path(PLOT_DIR, "distance_heatmap_rv.png"),
+       plot = dist_heatmap_rv, width = 8, height = 6, dpi = 150)
+```
+
+## 3.6  DE results & LFC shrinkage – RV only
+
+```{r results-rv}
+res_rv <- results(dds_rv, contrast = c("condition", "HTN", "Control"))
+summary(res_rv[order(res_rv$padj), ])
+
+res_rv_shrunk <- lfcShrink(dds_rv,
+  coef = "condition_HTN_vs_Control", type = "apeglm")
+res_df_rv <- as.data.frame(res_rv_shrunk[order(res_rv_shrunk$padj), ])
+```
+
+## 3.7  Annotate – RV only
+
+```{r annotate-rv}
+res_df_rv <- annotate_results(res_df_rv)
+```
+
+## 3.8  Significance & top labels – RV only
+
+```{r sig-rv}
+rv_out        <- mark_significance(res_df_rv)
+res_df_rv     <- rv_out$res_df
+sig_only_rv   <- rv_out$sig_only
+top_labels_rv <- rv_out$top_labels
+
+table(res_df_rv$significance)
+cat("Significant DEGs (RV):", nrow(sig_only_rv), "\n")
+```
+
+## 3.9  MA plot – RV only
+
+```{r ma-rv}
+p_ma_rv <- make_ma_plot(res_df_rv, top_labels_rv,
+  "MA Plot – Right Ventricle Only (HTN vs Control)")
+print(p_ma_rv)
+ggsave(file.path(PLOT_DIR, "ma_plot_rv.png"),
+       plot = p_ma_rv, width = 8, height = 6, dpi = 150)
+```
+
+## 3.10  Volcano plot – RV only
+
+```{r volcano-rv}
+volcano_rv <- make_volcano_plot(res_df_rv, top_labels_rv,
+  "Volcano Plot – Right Ventricle Only (HTN vs Control)")
+print(volcano_rv)
+ggsave(file.path(PLOT_DIR, "volcano_rv.png"),
+       plot = volcano_rv, width = 8, height = 6, dpi = 150)
+```
+
+## 3.11  Heatmap – RV only
+
+```{r heatmap-rv}
+top_heatmap_rv <- make_heatmap(
+  vsd_obj         = vsd_rv,
+  sig_only        = sig_only_rv,
+  coldata_sub     = coldata_rv,
+  annotation_vars = "condition",
+  order_by        = "condition",
+  title           = "Top DE Genes – Right Ventricle Only"
+)
+if (!is.null(top_heatmap_rv)) {
+  print(top_heatmap_rv)
+  ggsave(file.path(PLOT_DIR, "heatmap_rv.png"),
+         plot = top_heatmap_rv, width = 10, height = 8, dpi = 150)
+}
+```
+
+## 3.12  Top 20 – RV only
+
+```{r top20-rv}
+top20_rv <- head(sig_only_rv[order(sig_only_rv$padj), ], 20)
+top20_rv[, c("gene_symbol", "gene_name", "log2FoldChange", "padj")]
+```
+
+## 3.13  Save RV output
+
+```{r save-rv}
+write.csv(res_df_rv,           "DESeq2_RV_HTN_vs_Control.csv",            row.names = FALSE)
+write.csv(sig_only_rv,         "DESeq2_RV_HTN_vs_Control_significant.csv", row.names = FALSE)
+write.csv(top20_rv,            "DESeq2_RV_top20.csv",                      row.names = FALSE)
+write.csv(normalized_counts_rv,"normalized_counts_rv.csv")
+```
+
+############################################################
+# ══════════════════════════════════════════════════════════
+#   Overlap summary: DEGs shared across all three analyses
+#
+#   Genes significant in all three analyses are the most
+#   robust HTN candidates — they survive both the full
+#   pooled model and chamber-specific subsetting.
+#   Genes unique to LV or RV suggest chamber-selective
+#   transcriptional responses to hypertension.
+# ══════════════════════════════════════════════════════════
+############################################################
+
+```{r overlap-summary}
+sig_pooled_ids <- rownames(sig_only_pooled)
+sig_lv_ids     <- rownames(sig_only_lv)
+sig_rv_ids     <- rownames(sig_only_rv)
+
+cat("Significant DEGs (padj < 0.05 & |LFC| > 1):\n")
+cat("  Pooled (ventricle + condition):", length(sig_pooled_ids), "\n")
+cat("  LV only:                       ", length(sig_lv_ids),     "\n")
+cat("  RV only:                       ", length(sig_rv_ids),     "\n")
+cat("  Pooled ∩ LV:                   ", length(intersect(sig_pooled_ids, sig_lv_ids)), "\n")
+cat("  Pooled ∩ RV:                   ", length(intersect(sig_pooled_ids, sig_rv_ids)), "\n")
+cat("  LV ∩ RV (shared chamber DEGs):", length(intersect(sig_lv_ids, sig_rv_ids)),     "\n")
+cat("  All three:                     ", length(Reduce(intersect,
+      list(sig_pooled_ids, sig_lv_ids, sig_rv_ids))), "\n")
+```
