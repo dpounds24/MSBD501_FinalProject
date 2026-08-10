@@ -22,6 +22,7 @@ Hypertension affects roughly 1.4 billion adults worldwide and is a leading drive
 - Top RV hit: **TNC** (padj ≈ 10⁻³⁴), an extracellular matrix glycoprotein and established marker of cardiac fibrosis — the single most significant gene across the entire study
 - **10 genes were significant across all three models** (pooled, LV, RV), representing the highest-confidence, chamber-independent hypertension targets: *HLX-AS1, HECW1, LSM14A, CD5L, SERPINA5, CATSPERT, DDX52, DHFR*, and two unannotated Ensembl IDs
 - A PCA restricted to the 213 significant DEGs cleanly separated HTN from Control samples on PC1 (70% variance) — even though global PCA on all genes showed no condition separation, since donor-level variability dominated
+
 **Takeaway:** pooled models can detect a hypertension signal, but chamber-stratified analysis reveals substantially more — and more specific — biology than pooling alone. Given the small cohort (n=5 donors), findings are hypothesis-generating rather than confirmatory.
  
 ## Dataset
